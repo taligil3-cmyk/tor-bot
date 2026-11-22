@@ -1,6 +1,5 @@
 # בוט התראות לתור פנוי אצל פרופ' דוד סוריאנו. לא קובע תור ולא שומר פרטים אישיים.
-import hashlib, json, os, re
-from datetime import date, datetime
+import json, os, re
 from pathlib import Path
 import requests
 from playwright.sync_api import sync_playwright
@@ -8,12 +7,14 @@ from playwright.sync_api import sync_playwright
 BOOKING_URL = ("https://www.tor4you.co.il/edstn.asp?siteid=3991&sid=AAFB2DF60A86CBFE"
                "&serviceid=102084&staffid=1748")
 NTFY_TOPIC = os.environ["NTFY_TOPIC"]
-ONLY_BEFORE = None  # למשל "2027-03-01" כדי לקבל התראה רק על תורים לפני התאריך הזה
-
+STOP_AT = (2027, 3)   # בודק את החודשים שלפני מרץ 2027
 STATE_FILE = Path(__file__).with_name("tor_bot_state.json")
-DATE_RE = re.compile(r"(?<![\d:])(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?(?![\d:])")
-NO_SLOTS_HINTS = ["אין תורים", "לא נמצאו תורים", "אין מועדים"]
+MONTHS = ["ינואר", "פברואר", "מרץ", "אפריל", "מאי", "יוני", "יולי",
+          "אוגוסט", "ספטמבר", "אוקטובר", "נובמבר", "דצמבר"]
+HEADER_RE = re.compile(r"(" + "|".join(MONTHS) + r")\s+(\d{4})")
+NO_SLOTS = "לא נמצאו תורים פנויים בחודש זה"
 # --- סוף חלק 1 ---
+
 
 def notify(title, message, priority="high"):
     requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=message.encode("utf-8"),
@@ -21,80 +22,107 @@ def notify(title, message, priority="high"):
                            "Click": BOOKING_URL, "Tags": "calendar"}, timeout=15)
 
 
-def read_page_text():
-    error = ""
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page(locale="he-IL")
-        try:
-            page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=90000)
-        except Exception as e:
-            error = str(e).splitlines()[0][:200]
-        page.wait_for_timeout(10000)
-        texts = []
+def month_name(ym):
+    return f"{MONTHS[ym[1] - 1]} {ym[0]}"
+
+
+def read_month(frame):
+    try:
+        text = frame.inner_text("body", timeout=5000)
+    except Exception:
+        return None, ""
+    m = HEADER_RE.search(text)
+    if not m:
+        return None, text
+    return (int(m.group(2)), MONTHS.index(m.group(1)) + 1), text
+
+
+def find_calendar(page):
+    for _ in range(20):
         for frame in page.frames:
-            try:
-                texts.append(frame.inner_text("body", timeout=5000))
-            except Exception:
-                pass
-        browser.close()
-    return "\n".join(texts), error
+            ym, text = read_month(frame)
+            if ym:
+                return frame, ym, text
+        page.wait_for_timeout(1000)
+    return None, None, ""
 
 
-def extract_dates(text):
-    today, found = date.today(), set()
-    for d, m, y in DATE_RE.findall(text):
-        d, m = int(d), int(m)
-        if y:
-            y = int(y) + (2000 if int(y) < 100 else 0)
-        else:
-            y = today.year if (m, d) >= (today.month, today.day) else today.year + 1
-        try:
-            dt = date(y, m, d)
-        except ValueError:
-            continue
-        if today <= dt <= date(today.year + 2, 12, 31):
-            found.add(dt)
-    if ONLY_BEFORE:
-        found = {dt for dt in found if dt < date.fromisoformat(ONLY_BEFORE)}
-    return found
-
-
-def fmt(dates):
-    return ", ".join(d.strftime("%d/%m/%Y") for d in sorted(dates)[:6])
+FIND_ARROWS_JS = """() => {
+  const out = [];
+  const arrows = ['<','>','‹','›','«','»','◄','►','◀','▶','❮','❯','<<','>>','→','←'];
+  document.querySelectorAll('a,button,span,div,img,td,th,i,input,svg').forEach((e, i) => {
+    const r = e.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    const t = ((e.innerText || e.value || '') + '').trim();
+    const cls = typeof e.className === 'string' ? e.className : '';
+    const attrs = [e.title, e.getAttribute('aria-label'), e.getAttribute('alt'), cls,
+                   e.getAttribute('src'), e.id, e.getAttribute('onclick')].join(' ').toLowerCase();
+    if (arrows.includes(t) || /הבא|הקודם|next|prev|arrow|forward|back|month/.test(attrs)) {
+      e.setAttribute('data-torbot', i);
+      out.push({key: t + '|' + attrs.slice(0, 120), id: i});
+    }
+  });
+  return out;
+}"""
 # --- סוף חלק 2 ---
 
 
-def main():
-    text, error = read_page_text()
-    print("error:", error or "none")
-    print("page text:", " ".join(text.split())[:1500])
-
-    if not text.strip():
-        if not STATE_FILE.exists():
-            notify("בוט התורים: האתר לא נפתח", f"שגיאה: {error}", priority="default")
-        raise SystemExit("empty page")
-
-    text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    dates = extract_dates(text)
-    no_slots = any(h in text for h in NO_SLOTS_HINTS)
-
-    if not STATE_FILE.exists():
-        snippet = " ".join(text.split())[:700]
-        msg = (f"הבוט פועל. תאריכים שמופיעים עכשיו: {fmt(dates)}" if dates
-               else f"הבוט פועל, אבל לא זיהה תאריכים. תחילת הדף: {snippet}")
-        notify("בוט התורים הופעל", msg, priority="default")
-    else:
-        old = {date.fromisoformat(s) for s in json.loads(STATE_FILE.read_text("utf-8"))["dates"]}
-        new = dates - old
-        if new and not no_slots:
-            earlier = {d for d in new if not old or d < min(old)}
-            title = "התפנה תור מוקדם!" if earlier else "הופיע תאריך פנוי חדש"
-            notify(title, f"תאריכים חדשים: {fmt(new)}. לחצי כאן כדי לקבוע.")
-    print(datetime.now().strftime("%H:%M"), "dates:", fmt(dates))
-    STATE_FILE.write_text(json.dumps({"dates": sorted(d.isoformat() for d in dates),
-                                      "hash": text_hash}), encoding="utf-8")
+def next_month(ym):
+    return (ym[0] + 1, 1) if ym[1] == 12 else (ym[0], ym[1] + 1)
 
 
-if __name__ == "__main__":
-    main()
+def click_and_wait(page, frame, cand_id, ym):
+    try:
+        frame.click(f'[data-torbot="{cand_id}"]', timeout=5000)
+    except Exception:
+        return None, None, ""
+    for _ in range(10):
+        page.wait_for_timeout(1000)
+        frame2, ym2, text = find_calendar_quick(page)
+        if ym2 and ym2 != ym:
+            page.wait_for_timeout(2000)
+            frame2, ym2, text = find_calendar_quick(page)
+            return frame2, ym2, text
+    return None, None, ""
+
+
+def find_calendar_quick(page):
+    for frame in page.frames:
+        ym, text = read_month(frame)
+        if ym:
+            return frame, ym, text
+    return None, None, ""
+
+
+def scan(browser):
+    page = browser.new_page(locale="he-IL")
+    try:
+        page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=90000)
+    except Exception:
+        pass
+    frame, ym, text = find_calendar(page)
+    if not ym:
+        return None, "לא נמצא לוח שנה בדף"
+    results = {}
+    while ym < STOP_AT:
+        results[ym] = NO_SLOTS not in text
+        print(month_name(ym), "יש תורים" if results[ym] else "אין תורים")
+        target = next_month(ym)
+        if target >= STOP_AT:
+            break
+        cands = frame.evaluate(FIND_ARROWS_JS)
+        moved = False
+        for c in cands:
+            frame2, ym2, text2 = click_and_wait(page, frame, c["id"], ym)
+            if ym2 == target:
+                frame, ym, text, moved = frame2, ym2, text2, True
+                break
+            if ym2:   # עבר לחודש הלא נכון - מתחילים מחדש מהדף
+                page.close()
+                return scan_again(browser, results, c["key"])
+        if not moved:
+            keys = "; ".join(c["key"][:40] for c in cands[:8])
+            return results, f"לא הצלחתי לעבור ל{month_name(target)}. כפתורים: {keys}"
+    page.close()
+    return results, ""
+# --- סוף חלק 3 ---
