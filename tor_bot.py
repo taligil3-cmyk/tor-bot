@@ -126,3 +126,63 @@ def scan(browser):
     page.close()
     return results, ""
 # --- סוף חלק 3 ---
+
+
+def scan_again(browser, results, bad_key):
+    page = browser.new_page(locale="he-IL")
+    try:
+        page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=90000)
+    except Exception:
+        pass
+    frame, ym, text = find_calendar(page)
+    while ym and next_month(ym) < STOP_AT:
+        target = next_month(ym)
+        cands = [c for c in frame.evaluate(FIND_ARROWS_JS) if c["key"] != bad_key]
+        moved = False
+        for c in cands:
+            frame2, ym2, text2 = click_and_wait(page, frame, c["id"], ym)
+            if ym2 == target:
+                frame, ym, text, moved = frame2, ym2, text2, True
+                results[ym] = NO_SLOTS not in text
+                print(month_name(ym), "יש תורים" if results[ym] else "אין תורים")
+                break
+            if ym2:
+                break
+        if not moved:
+            return results, f"לא הצלחתי לעבור ל{month_name(target)}"
+    page.close()
+    return results, ""
+
+
+def main():
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        results, error = scan(browser)
+        browser.close()
+    print("error:", error or "none")
+
+    state = json.loads(STATE_FILE.read_text("utf-8")) if STATE_FILE.exists() else {}
+    first_run = "months" not in state
+    if results is None:
+        if first_run:
+            notify("בוט התורים: בעיה", error, priority="default")
+        raise SystemExit(error)
+
+    with_slots = sorted(f"{y}-{m:02d}" for (y, m), has in results.items() if has)
+    checked = ", ".join(month_name(k) for k in sorted(results))
+    if first_run:
+        found = ", ".join(month_name(tuple(map(int, s.split("-")))) for s in with_slots)
+        msg = f"נבדקו: {checked}. " + (f"יש תורים ב: {found}" if found else "אין כרגע תורים לפני מרץ.")
+        if error:
+            msg += f" שימי לב: {error}"
+        notify("בוט התורים הופעל", msg, priority="default")
+    else:
+        new = [s for s in with_slots if s not in state["months"]]
+        if new:
+            names = ", ".join(month_name(tuple(map(int, s.split("-")))) for s in new)
+            notify("התפנה תור מוקדם!", f"יש תור פנוי ב{names}. לחצי כאן כדי לקבוע.")
+    STATE_FILE.write_text(json.dumps({"months": with_slots}), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()
