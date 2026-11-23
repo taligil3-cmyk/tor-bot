@@ -22,7 +22,7 @@ jobs:
           python-version: "3.12"
       - run: pip install playwright requests
       - run: python -m playwright install --with-deps chromium
-      - run: python tor_bot.py
+      - run: python -u tor_bot.py
       - name: save state
         if: always()
         run: |
