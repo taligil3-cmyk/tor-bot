@@ -128,6 +128,11 @@ def scan(browser):
 # --- סוף חלק 3 ---
 
 
+import time
+CHECK_EVERY_SECONDS = 60
+RUN_MINUTES = float(os.environ.get("RUN_MINUTES", "55"))
+
+
 def scan_again(browser, results, bad_key):
     page = browser.new_page(locale="he-IL")
     try:
@@ -154,34 +159,43 @@ def scan_again(browser, results, bad_key):
     return results, ""
 
 
+def check(browser, known):
+    try:
+        results, error = scan(browser)
+    finally:
+        for ctx in browser.contexts:
+            ctx.close()
+    if results is None:
+        print("error:", error)
+        return known
+    with_slots = sorted(f"{y}-{m:02d}" for (y, m), has in results.items() if has)
+    new = [s for s in with_slots if s not in known]
+    if new:
+        names = ", ".join(month_name(tuple(map(int, s.split("-")))) for s in new)
+        notify("התפנה תור מוקדם!", f"יש תור פנוי ב{names}. לחצי כאן כדי לקבוע.", priority="urgent")
+    if error:
+        print("error:", error)
+        return sorted(set(known) | set(with_slots))
+    return with_slots
+
+
 def main():
+    state = json.loads(STATE_FILE.read_text("utf-8")) if STATE_FILE.exists() else {}
+    known = state.get("months", [])
+    end = time.time() + RUN_MINUTES * 60
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        results, error = scan(browser)
+        while True:
+            start = time.time()
+            try:
+                known = check(browser, known)
+            except Exception as e:
+                print("שגיאה:", str(e)[:200])
+            STATE_FILE.write_text(json.dumps({"months": known}), encoding="utf-8")
+            if time.time() + CHECK_EVERY_SECONDS > end:
+                break
+            time.sleep(max(5, CHECK_EVERY_SECONDS - (time.time() - start)))
         browser.close()
-    print("error:", error or "none")
-
-    state = json.loads(STATE_FILE.read_text("utf-8")) if STATE_FILE.exists() else {}
-    first_run = "months" not in state
-    if results is None:
-        if first_run:
-            notify("בוט התורים: בעיה", error, priority="default")
-        raise SystemExit(error)
-
-    with_slots = sorted(f"{y}-{m:02d}" for (y, m), has in results.items() if has)
-    checked = ", ".join(month_name(k) for k in sorted(results))
-    if first_run:
-        found = ", ".join(month_name(tuple(map(int, s.split("-")))) for s in with_slots)
-        msg = f"נבדקו: {checked}. " + (f"יש תורים ב: {found}" if found else "אין כרגע תורים לפני מרץ.")
-        if error:
-            msg += f" שימי לב: {error}"
-        notify("בוט התורים הופעל", msg, priority="default")
-    else:
-        new = [s for s in with_slots if s not in state["months"]]
-        if new:
-            names = ", ".join(month_name(tuple(map(int, s.split("-")))) for s in new)
-            notify("התפנה תור מוקדם!", f"יש תור פנוי ב{names}. לחצי כאן כדי לקבוע.")
-    STATE_FILE.write_text(json.dumps({"months": with_slots}), encoding="utf-8")
 
 
 if __name__ == "__main__":
